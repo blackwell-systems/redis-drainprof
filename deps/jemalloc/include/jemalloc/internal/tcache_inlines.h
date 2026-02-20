@@ -8,6 +8,13 @@
 #include "jemalloc/internal/sz.h"
 #include "jemalloc/internal/util.h"
 
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+extern drainprof *g_drainprof;
+extern atomic_zu_t g_tcache_dalloc_small_calls;
+extern atomic_zu_t g_tcache_dalloc_small_tracked;
+#endif
+
 static inline bool
 tcache_enabled_get(tsd_t *tsd) {
 	return tsd_tcache_enabled_get(tsd);
@@ -129,6 +136,22 @@ JEMALLOC_ALWAYS_INLINE void
 tcache_dalloc_small(tsd_t *tsd, tcache_t *tcache, void *ptr, szind_t binind,
     bool slow_path) {
 	assert(tcache_salloc(tsd_tsdn(tsd), ptr) <= SC_SMALL_MAXCLASS);
+
+#ifdef ENABLE_DRAINPROF
+	/* DISABLED: Old tcache dealloc instrumentation - we now track at free_fastpath layer
+	atomic_fetch_add_zu(&g_tcache_dalloc_small_calls, 1, ATOMIC_RELAXED);
+	if (g_drainprof != NULL) {
+		tsdn_t *tsdn = tsd_tsdn(tsd);
+		edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ptr);
+		if (edata != NULL && edata_slab_get(edata)) {
+			uint64_t granule_id = (uint64_t)edata;
+			uint64_t alloc_id = (uint64_t)ptr;
+			drainprof_alloc_deregister(g_drainprof, granule_id, alloc_id);
+			atomic_fetch_add_zu(&g_tcache_dalloc_small_tracked, 1, ATOMIC_RELAXED);
+		}
+	}
+	*/
+#endif
 
 	cache_bin_t *bin = &tcache->bins[binind];
 	/*

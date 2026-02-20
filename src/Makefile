@@ -86,6 +86,8 @@ endif
 
 ifeq ($(USE_JEMALLOC),yes)
 	MALLOC=jemalloc
+	CFLAGS+=-DENABLE_DRAINPROF -I$(shell pwd)/../../../drainability-profiler/include
+	REDIS_CFLAGS+=-DENABLE_DRAINPROF
 endif
 
 ifeq ($(USE_JEMALLOC),no)
@@ -271,7 +273,12 @@ endif
 ifeq ($(MALLOC),jemalloc)
 	DEPENDENCY_TARGETS+= jemalloc
 	FINAL_CFLAGS+= -DUSE_JEMALLOC -I../deps/jemalloc/include
-	FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a $(FINAL_LIBS)
+	# Link libdrainprof when ENABLE_DRAINPROF is set (must come before jemalloc since jemalloc depends on it)
+	ifneq ($(findstring -DENABLE_DRAINPROF,$(CFLAGS)),)
+		FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a ../../drainability-profiler/libdrainprof.a $(FINAL_LIBS)
+	else
+		FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a $(FINAL_LIBS)
+	endif
 endif
 
 # LIBSSL & LIBCRYPTO

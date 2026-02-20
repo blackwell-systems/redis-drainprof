@@ -5736,6 +5736,107 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             lazyfreeGetPendingObjectsCount(),
             lazyfreeGetFreedObjectsCount()
         );
+
+#ifdef ENABLE_DRAINPROF
+        /* Add drainprof metrics - jemalloc extent drainability
+         * Measures instantaneous extent occupancy via periodic sweep:
+         * - drainable = extents with zero live allocations (could be returned to OS)
+         * - pinned = extents with one or more live allocations (cannot be returned) */
+        extern double je_jemalloc_get_drainprof_dsr(void);
+        extern void je_jemalloc_get_drainprof_stats(uint64_t *total, uint64_t *drainable, uint64_t *pinned);
+        extern void je_jemalloc_get_drainprof_debug_stats(uint64_t *malloc_calls, uint64_t *attempts, uint64_t *successes, uint64_t *failures);
+        extern void je_jemalloc_get_drainprof_fill_stats(uint64_t *fill_calls, uint64_t *drainprof_null, uint64_t *not_slab, uint64_t *tracked, uint64_t *objects_registered);
+        extern void je_jemalloc_get_drainprof_flush_stats(uint64_t *flush_calls, uint64_t *small_count, uint64_t *drainprof_null, uint64_t *not_slab, uint64_t *tracked);
+        extern void je_jemalloc_get_drainprof_dalloc_stats(uint64_t *dalloc_calls, uint64_t *dalloc_tracked);
+        extern void je_jemalloc_get_drainprof_fastpath_stats(uint64_t *fastpath_calls, uint64_t *fastpath_tracked);
+        extern void je_jemalloc_get_drainprof_malloc_fastpath_stats(uint64_t *malloc_calls, uint64_t *malloc_tracked);
+        extern void je_jemalloc_get_drainprof_accounting(uint64_t *total_allocs, uint64_t *total_deallocs);
+
+        double dsr = je_jemalloc_get_drainprof_dsr();
+        uint64_t total_extents = 0, drainable_extents = 0, pinned_extents = 0;
+        je_jemalloc_get_drainprof_stats(&total_extents, &drainable_extents, &pinned_extents);
+
+        uint64_t malloc_calls = 0, reg_attempts = 0, reg_successes = 0, reg_failures = 0;
+        je_jemalloc_get_drainprof_debug_stats(&malloc_calls, &reg_attempts, &reg_successes, &reg_failures);
+
+        uint64_t fill_calls = 0, fill_drainprof_null = 0, fill_not_slab = 0, fill_tracked = 0, fill_objects_registered = 0;
+        je_jemalloc_get_drainprof_fill_stats(&fill_calls, &fill_drainprof_null, &fill_not_slab, &fill_tracked, &fill_objects_registered);
+
+        uint64_t flush_calls = 0, flush_small_count = 0, flush_drainprof_null = 0, flush_not_slab = 0, flush_tracked = 0;
+        je_jemalloc_get_drainprof_flush_stats(&flush_calls, &flush_small_count, &flush_drainprof_null, &flush_not_slab, &flush_tracked);
+
+        uint64_t dalloc_calls = 0, dalloc_tracked = 0;
+        je_jemalloc_get_drainprof_dalloc_stats(&dalloc_calls, &dalloc_tracked);
+
+        uint64_t fastpath_calls = 0, fastpath_tracked = 0;
+        je_jemalloc_get_drainprof_fastpath_stats(&fastpath_calls, &fastpath_tracked);
+
+        uint64_t malloc_fastpath_calls = 0, malloc_fastpath_tracked = 0;
+        je_jemalloc_get_drainprof_malloc_fastpath_stats(&malloc_fastpath_calls, &malloc_fastpath_tracked);
+
+        uint64_t total_allocs = 0, total_deallocs = 0;
+        je_jemalloc_get_drainprof_accounting(&total_allocs, &total_deallocs);
+
+        if (dsr >= 0.0) {
+            info = sdscatprintf(info,
+                "mem_drainability_ratio:%.4f\r\n"
+                "mem_drainprof_enabled:yes\r\n"
+                "mem_drainprof_total_extents:%llu\r\n"
+                "mem_drainprof_drainable_extents:%llu\r\n"
+                "mem_drainprof_pinned_extents:%llu\r\n"
+                "mem_drainprof_arena_malloc_small_calls:%llu\r\n"
+                "mem_drainprof_lazy_registration_attempts:%llu\r\n"
+                "mem_drainprof_lazy_registration_successes:%llu\r\n"
+                "mem_drainprof_lazy_registration_failures:%llu\r\n"
+                "mem_drainprof_cache_bin_fill_calls:%llu\r\n"
+                "mem_drainprof_cache_bin_fill_drainprof_null:%llu\r\n"
+                "mem_drainprof_cache_bin_fill_not_slab:%llu\r\n"
+                "mem_drainprof_cache_bin_fill_tracked:%llu\r\n"
+                "mem_drainprof_cache_bin_fill_objects_registered:%llu\r\n"
+                "mem_drainprof_tcache_flush_calls:%llu\r\n"
+                "mem_drainprof_tcache_flush_small_count:%llu\r\n"
+                "mem_drainprof_tcache_flush_drainprof_null:%llu\r\n"
+                "mem_drainprof_tcache_flush_not_slab:%llu\r\n"
+                "mem_drainprof_tcache_flush_tracked:%llu\r\n"
+                "mem_drainprof_tcache_dalloc_small_calls:%llu\r\n"
+                "mem_drainprof_tcache_dalloc_small_tracked:%llu\r\n"
+                "mem_drainprof_malloc_fastpath_calls:%llu\r\n"
+                "mem_drainprof_malloc_fastpath_tracked:%llu\r\n"
+                "mem_drainprof_free_fastpath_calls:%llu\r\n"
+                "mem_drainprof_free_fastpath_tracked:%llu\r\n"
+                "mem_drainprof_total_allocs:%llu\r\n"
+                "mem_drainprof_total_deallocs:%llu\r\n",
+                dsr,
+                (unsigned long long)total_extents,
+                (unsigned long long)drainable_extents,
+                (unsigned long long)pinned_extents,
+                (unsigned long long)malloc_calls,
+                (unsigned long long)reg_attempts,
+                (unsigned long long)reg_successes,
+                (unsigned long long)reg_failures,
+                (unsigned long long)fill_calls,
+                (unsigned long long)fill_drainprof_null,
+                (unsigned long long)fill_not_slab,
+                (unsigned long long)fill_tracked,
+                (unsigned long long)fill_objects_registered,
+                (unsigned long long)flush_calls,
+                (unsigned long long)flush_small_count,
+                (unsigned long long)flush_drainprof_null,
+                (unsigned long long)flush_not_slab,
+                (unsigned long long)flush_tracked,
+                (unsigned long long)dalloc_calls,
+                (unsigned long long)dalloc_tracked,
+                (unsigned long long)malloc_fastpath_calls,
+                (unsigned long long)malloc_fastpath_tracked,
+                (unsigned long long)fastpath_calls,
+                (unsigned long long)fastpath_tracked,
+                (unsigned long long)total_allocs,
+                (unsigned long long)total_deallocs);
+        } else {
+            info = sdscatprintf(info, "mem_drainprof_enabled:no\r\n");
+        }
+#endif
+
         freeMemoryOverheadData(mh);
     }
 

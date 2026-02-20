@@ -26,6 +26,15 @@
 #include "jemalloc/internal/thread_event.h"
 #include "jemalloc/internal/util.h"
 
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+extern drainprof *g_drainprof;
+atomic_zu_t g_malloc_fastpath_calls;
+atomic_zu_t g_malloc_fastpath_tracked;
+atomic_zu_t g_free_fastpath_calls;
+atomic_zu_t g_free_fastpath_tracked;
+#endif
+
 /******************************************************************************/
 /* Data. */
 
@@ -3149,6 +3158,21 @@ bool free_fastpath(void *ptr, size_t size, bool size_hint) {
 		return false;
 	}
 
+#ifdef ENABLE_DRAINPROF
+	/* Track deallocation in drainprof after successful cache_bin placement */
+	atomic_fetch_add_zu(&g_free_fastpath_calls, 1, ATOMIC_RELAXED);
+	if (g_drainprof != NULL) {
+		tsdn_t *tsdn = tsd_tsdn(tsd);
+		edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ptr);
+		if (edata != NULL && edata_slab_get(edata)) {
+			uint64_t granule_id = (uint64_t)edata;
+			uint64_t alloc_id = (uint64_t)ptr;
+			drainprof_alloc_deregister(g_drainprof, granule_id, alloc_id);
+			atomic_fetch_add_zu(&g_free_fastpath_tracked, 1, ATOMIC_RELAXED);
+		}
+	}
+#endif
+
 	*tsd_thread_deallocatedp_get(tsd) = deallocated_after;
 
 	return true;
@@ -4483,3 +4507,15 @@ get_defrag_hint(void* ptr) {
 	assert(ptr != NULL);
 	return iget_defrag_hint(TSDN_NULL, ptr);
 }
+
+#ifdef ENABLE_DRAINPROF
+void jemalloc_get_drainprof_fastpath_stats(uint64_t *fastpath_calls, uint64_t *fastpath_tracked) {
+	*fastpath_calls = atomic_load_zu(&g_free_fastpath_calls, ATOMIC_RELAXED);
+	*fastpath_tracked = atomic_load_zu(&g_free_fastpath_tracked, ATOMIC_RELAXED);
+}
+
+void jemalloc_get_drainprof_malloc_fastpath_stats(uint64_t *malloc_calls, uint64_t *malloc_tracked) {
+	*malloc_calls = atomic_load_zu(&g_malloc_fastpath_calls, ATOMIC_RELAXED);
+	*malloc_tracked = atomic_load_zu(&g_malloc_fastpath_tracked, ATOMIC_RELAXED);
+}
+#endif

@@ -12,6 +12,23 @@
 #include "jemalloc/internal/safety_check.h"
 #include "jemalloc/internal/util.h"
 
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+/* Global drainprof instance defined in extent.c */
+extern drainprof *g_drainprof;
+
+/* Debug counters for tracking registration behavior */
+static atomic_zu_t g_arena_malloc_small_calls;
+static atomic_zu_t g_lazy_registration_attempts;
+static atomic_zu_t g_lazy_registration_successes;
+static atomic_zu_t g_lazy_registration_failures;
+static atomic_zu_t g_cache_bin_fill_calls;
+static atomic_zu_t g_cache_bin_fill_drainprof_null;
+static atomic_zu_t g_cache_bin_fill_not_slab;
+static atomic_zu_t g_cache_bin_fill_tracked;
+static atomic_zu_t g_cache_bin_fill_objects_registered;
+#endif
+
 JEMALLOC_DIAGNOSTIC_DISABLE_SPURIOUS
 
 /******************************************************************************/
@@ -566,6 +583,14 @@ arena_do_deferred_work(tsdn_t *tsdn, arena_t *arena) {
 
 void
 arena_slab_dalloc(tsdn_t *tsdn, arena_t *arena, edata_t *slab) {
+#ifdef ENABLE_DRAINPROF
+	/* Slab is fully empty and being deallocated - close granule tracking */
+	if (g_drainprof != NULL) {
+		uint64_t granule_id = (uint64_t)slab;
+		drainprof_granule_close(g_drainprof, granule_id);
+	}
+#endif
+
 	bool deferred_work_generated = false;
 	pa_dalloc(tsdn, &arena->pa_shard, slab, &deferred_work_generated);
 	if (deferred_work_generated) {
@@ -854,6 +879,10 @@ arena_slab_alloc(tsdn_t *tsdn, arena_t *arena, szind_t binind, unsigned binshard
 	edata_nfree_binshard_set(slab, bin_info->nregs, binshard);
 	bitmap_init(slab_data->bitmap, &bin_info->bitmap_info, false);
 
+	/* Note: Slab granule registration happens lazily in arena_malloc_small
+	 * on first allocation contact, not here. This catches all slabs regardless
+	 * of whether they come from arena_slab_alloc, tcache, or bin cache. */
+
 	return slab;
 }
 
@@ -981,6 +1010,28 @@ label_refill:
 
 			arena_slab_reg_alloc_batch(slabcur, bin_info, cnt,
 			    &ptrs.ptr[filled]);
+
+#ifdef ENABLE_DRAINPROF
+			/* DISABLED: Old tcache refill instrumentation - we now track at malloc/free fastpath layer
+			atomic_fetch_add_zu(&g_cache_bin_fill_calls, 1, ATOMIC_RELAXED);
+			if (g_drainprof == NULL) {
+				atomic_fetch_add_zu(&g_cache_bin_fill_drainprof_null, 1, ATOMIC_RELAXED);
+			} else if (!edata_slab_get(slabcur)) {
+				atomic_fetch_add_zu(&g_cache_bin_fill_not_slab, 1, ATOMIC_RELAXED);
+			} else {
+				uint64_t granule_id = (uint64_t)slabcur;
+				drainprof_granule_open(g_drainprof, granule_id);
+				size_t usize = sz_index2size(binind);
+				for (unsigned i = 0; i < cnt; i++) {
+					uint64_t alloc_id = (uint64_t)ptrs.ptr[filled + i];
+					drainprof_alloc_register(g_drainprof, granule_id, alloc_id, usize);
+					atomic_fetch_add_zu(&g_cache_bin_fill_objects_registered, 1, ATOMIC_RELAXED);
+				}
+				atomic_fetch_add_zu(&g_cache_bin_fill_tracked, 1, ATOMIC_RELAXED);
+			}
+			*/
+#endif
+
 			made_progress = true;
 			filled += cnt;
 			continue;
@@ -1140,6 +1191,10 @@ arena_bin_malloc_no_fresh_slab(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
 
 static void *
 arena_malloc_small(tsdn_t *tsdn, arena_t *arena, szind_t binind, bool zero) {
+#ifdef ENABLE_DRAINPROF
+	atomic_fetch_add_zu(&g_arena_malloc_small_calls, 1, ATOMIC_RELAXED);
+#endif
+
 	assert(binind < SC_NBINS);
 	const bin_info_t *bin_info = &bin_infos[binind];
 	size_t usize = sz_index2size(binind);
@@ -1183,6 +1238,35 @@ arena_malloc_small(tsdn_t *tsdn, arena_t *arena, szind_t binind, bool zero) {
 		memset(ret, 0, usize);
 	}
 	arena_decay_tick(tsdn, arena);
+
+#ifdef ENABLE_DRAINPROF
+	/* Lazy slab registration: open granule on first allocation contact.
+	 * This catches all slabs (from tcache, bin cache, or fresh allocation),
+	 * not just slabs from arena_slab_alloc. */
+	if (ret != NULL && g_drainprof != NULL) {
+		edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ret);
+		if (edata != NULL && edata_slab_get(edata)) {
+			atomic_fetch_add_zu(&g_lazy_registration_attempts, 1, ATOMIC_RELAXED);
+
+			/* For slabs: use slab data structure address as unique granule ID.
+			 * edata_addr_get returns extent base (multiple slabs share same extent),
+			 * but edata itself is unique per slab. */
+			uint64_t granule_id = (uint64_t)edata;
+			uint64_t alloc_id = (uint64_t)ret;
+
+			/* Try to register slab as granule (idempotent - ignore if already open) */
+			int open_result = drainprof_granule_open(g_drainprof, granule_id);
+			if (open_result == 0) {
+				atomic_fetch_add_zu(&g_lazy_registration_successes, 1, ATOMIC_RELAXED);
+			} else {
+				atomic_fetch_add_zu(&g_lazy_registration_failures, 1, ATOMIC_RELAXED);
+			}
+
+			/* Track allocation within slab */
+			drainprof_alloc_register(g_drainprof, granule_id, alloc_id, usize);
+		}
+	}
+#endif
 
 	return ret;
 }
@@ -1387,6 +1471,15 @@ void
 arena_dalloc_small(tsdn_t *tsdn, void *ptr) {
 	edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ptr);
 	arena_t *arena = arena_get_from_edata(edata);
+
+#ifdef ENABLE_DRAINPROF
+	/* Track deallocation for drainability measurement */
+	if (g_drainprof != NULL && edata != NULL && edata_slab_get(edata)) {
+		uint64_t granule_id = (uint64_t)edata;
+		uint64_t alloc_id = (uint64_t)ptr;
+		drainprof_alloc_deregister(g_drainprof, granule_id, alloc_id);
+	}
+#endif
 
 	arena_dalloc_bin(tsdn, arena, edata, ptr);
 	arena_decay_tick(tsdn, arena);
@@ -1889,3 +1982,98 @@ arena_postfork_child(tsdn_t *tsdn, arena_t *arena) {
 		malloc_mutex_postfork_child(tsdn, &arena->tcache_ql_mtx);
 	}
 }
+
+#ifdef ENABLE_DRAINPROF
+/* API to expose drainprof metrics to Redis INFO command.
+ * Uses sweep model: walks all extents and counts drainable vs pinned based on
+ * current occupancy (zero vs non-zero live allocations). */
+double
+jemalloc_get_drainprof_dsr(void) {
+	if (g_drainprof == NULL) {
+		return -1.0;
+	}
+	drainprof_snapshot_t snap;
+	drainprof_sweep(g_drainprof, &snap);
+	return snap.dsr;
+}
+
+void
+jemalloc_get_drainprof_stats(uint64_t *total_extents, uint64_t *drainable_extents, uint64_t *pinned_extents) {
+	if (g_drainprof == NULL) {
+		*total_extents = 0;
+		*drainable_extents = 0;
+		*pinned_extents = 0;
+		return;
+	}
+	drainprof_snapshot_t snap;
+	drainprof_sweep(g_drainprof, &snap);
+	*total_extents = snap.total_closes;
+	*drainable_extents = snap.drainable_closes;
+	*pinned_extents = snap.pinned_closes;
+}
+
+void
+jemalloc_get_drainprof_accounting(uint64_t *total_allocs, uint64_t *total_deallocs) {
+	if (g_drainprof == NULL) {
+		*total_allocs = 0;
+		*total_deallocs = 0;
+		return;
+	}
+	drainprof_snapshot_t snap;
+	drainprof_sweep(g_drainprof, &snap);
+	*total_allocs = snap.total_allocs;
+	*total_deallocs = snap.total_deallocs;
+}
+
+void
+jemalloc_get_drainprof_debug_stats(uint64_t *malloc_calls, uint64_t *attempts, uint64_t *successes, uint64_t *failures) {
+	*malloc_calls = atomic_load_zu(&g_arena_malloc_small_calls, ATOMIC_RELAXED);
+	*attempts = atomic_load_zu(&g_lazy_registration_attempts, ATOMIC_RELAXED);
+	*successes = atomic_load_zu(&g_lazy_registration_successes, ATOMIC_RELAXED);
+	*failures = atomic_load_zu(&g_lazy_registration_failures, ATOMIC_RELAXED);
+}
+
+void
+jemalloc_get_drainprof_fill_stats(uint64_t *fill_calls, uint64_t *drainprof_null, uint64_t *not_slab, uint64_t *tracked, uint64_t *objects_registered) {
+	*fill_calls = atomic_load_zu(&g_cache_bin_fill_calls, ATOMIC_RELAXED);
+	*drainprof_null = atomic_load_zu(&g_cache_bin_fill_drainprof_null, ATOMIC_RELAXED);
+	*not_slab = atomic_load_zu(&g_cache_bin_fill_not_slab, ATOMIC_RELAXED);
+	*tracked = atomic_load_zu(&g_cache_bin_fill_tracked, ATOMIC_RELAXED);
+	*objects_registered = atomic_load_zu(&g_cache_bin_fill_objects_registered, ATOMIC_RELAXED);
+}
+#endif
+
+#ifdef ENABLE_DRAINPROF
+/* Get diagnostic summary of pinned slabs */
+void
+jemalloc_get_drainprof_diagnostic_info(char *buf, size_t bufsize) {
+	if (g_drainprof == NULL) {
+		snprintf(buf, bufsize, "drainprof not initialized");
+		return;
+	}
+	
+	drainprof_diagnostic_summary *summary = drainprof_diagnostic_summary_compute(g_drainprof);
+	if (summary == NULL) {
+		snprintf(buf, bufsize, "no pinning reports available (all slabs drainable or not yet swept)");
+		return;
+	}
+	
+	int written = snprintf(buf, bufsize,
+		"Pinned slabs: %u reports, %u total pinning allocs\n",
+		summary->reports_analyzed, summary->total_pinning_allocs);
+	
+	/* Show top 10 allocation sites that are pinning slabs */
+	for (uint32_t i = 0; i < summary->site_count && i < 10 && written < (int)bufsize - 1; i++) {
+		drainprof_summary_site_entry *site = &summary->sites[i];
+		written += snprintf(buf + written, bufsize - written,
+			"  %s:%u - %u pinning, %u total allocs, %zu bytes\n",
+			site->site.file ? site->site.file : "unknown",
+			site->site.line,
+			site->pinning_count,
+			site->total_allocs,
+			site->total_bytes);
+	}
+	
+	drainprof_diagnostic_summary_free(summary);
+}
+#endif

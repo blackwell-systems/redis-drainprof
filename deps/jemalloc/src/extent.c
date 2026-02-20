@@ -8,6 +8,15 @@
 #include "jemalloc/internal/ph.h"
 #include "jemalloc/internal/mutex.h"
 
+/* ============================================
+ * libdrainprof instrumentation
+ * ============================================ */
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+drainprof *g_drainprof = NULL;
+static bool g_drainprof_initialized = false;
+#endif
+
 /******************************************************************************/
 /* Data. */
 
@@ -1020,6 +1029,22 @@ extent_alloc_wrapper(tsdn_t *tsdn, pac_t *pac, ehooks_t *ehooks,
 		edata_cache_put(tsdn, pac->edata_cache, edata);
 		return NULL;
 	}
+
+#ifdef ENABLE_DRAINPROF
+	/* Initialize drainprof on first extent allocation with large capacity for slabs */
+	if (!g_drainprof_initialized) {
+		drainprof_config config;
+		drainprof_config_default(&config);
+		config.mode = DRAINPROF_DIAGNOSTIC;  /* Enable per-granule tracking */
+		config.slot_capacity = 32768;  /* Support up to 32K concurrent slabs */
+		config.max_buffered_reports = 100;  /* Keep last 100 pinned slab reports */
+		config.verbose = false;  /* Don't spam stderr */
+		g_drainprof = drainprof_create_with_config(&config);
+		g_drainprof_initialized = true;
+	}
+	/* Note: We track slabs (within extents) via lazy registration in arena_malloc_small,
+	 * not top-level extents here. This avoids double-tracking and slot collisions. */
+#endif
 
 	return edata;
 }

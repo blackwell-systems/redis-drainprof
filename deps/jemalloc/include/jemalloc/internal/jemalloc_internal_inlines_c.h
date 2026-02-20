@@ -8,6 +8,13 @@
 #include "jemalloc/internal/thread_event.h"
 #include "jemalloc/internal/witness.h"
 
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+extern drainprof *g_drainprof;
+extern atomic_zu_t g_malloc_fastpath_calls;
+extern atomic_zu_t g_malloc_fastpath_tracked;
+#endif
+
 /*
  * Translating the names of the 'i' functions:
  *   Abbreviations used in the first part of the function name (before
@@ -325,11 +332,43 @@ imalloc_fastpath(size_t size, void *(fallback_alloc)(size_t)) {
 	 */
 	ret = cache_bin_alloc_easy(bin, &tcache_success);
 	if (tcache_success) {
+#ifdef ENABLE_DRAINPROF
+		/* Track allocation in drainprof after successful cache_bin allocation */
+		atomic_fetch_add_zu(&g_malloc_fastpath_calls, 1, ATOMIC_RELAXED);
+		if (g_drainprof != NULL) {
+			tsdn_t *tsdn = tsd_tsdn(tsd);
+			edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ret);
+			if (edata != NULL && edata_slab_get(edata)) {
+				uint64_t granule_id = (uint64_t)edata;
+				/* Lazy register slab on first allocation (idempotent) */
+				drainprof_granule_open(g_drainprof, granule_id);
+				uint64_t alloc_id = (uint64_t)ret;
+				drainprof_alloc_register(g_drainprof, granule_id, alloc_id, size);
+				atomic_fetch_add_zu(&g_malloc_fastpath_tracked, 1, ATOMIC_RELAXED);
+			}
+		}
+#endif
 		fastpath_success_finish(tsd, allocated_after, bin, ret);
 		return ret;
 	}
 	ret = cache_bin_alloc(bin, &tcache_success);
 	if (tcache_success) {
+#ifdef ENABLE_DRAINPROF
+		/* Track allocation in drainprof after successful cache_bin allocation */
+		atomic_fetch_add_zu(&g_malloc_fastpath_calls, 1, ATOMIC_RELAXED);
+		if (g_drainprof != NULL) {
+			tsdn_t *tsdn = tsd_tsdn(tsd);
+			edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ret);
+			if (edata != NULL && edata_slab_get(edata)) {
+				uint64_t granule_id = (uint64_t)edata;
+				/* Lazy register slab on first allocation (idempotent) */
+				drainprof_granule_open(g_drainprof, granule_id);
+				uint64_t alloc_id = (uint64_t)ret;
+				drainprof_alloc_register(g_drainprof, granule_id, alloc_id, size);
+				atomic_fetch_add_zu(&g_malloc_fastpath_tracked, 1, ATOMIC_RELAXED);
+			}
+		}
+#endif
 		fastpath_success_finish(tsd, allocated_after, bin, ret);
 		return ret;
 	}

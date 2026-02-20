@@ -7,6 +7,20 @@
 #include "jemalloc/internal/san.h"
 #include "jemalloc/internal/sc.h"
 
+#ifdef ENABLE_DRAINPROF
+#include <drainprof.h>
+extern drainprof *g_drainprof;
+
+/* Debug counters for deallocation tracking */
+static atomic_zu_t g_tcache_flush_calls;
+static atomic_zu_t g_tcache_flush_small_count;
+static atomic_zu_t g_tcache_flush_drainprof_null;
+static atomic_zu_t g_tcache_flush_not_slab;
+static atomic_zu_t g_tcache_flush_tracked;
+atomic_zu_t g_tcache_dalloc_small_calls;
+atomic_zu_t g_tcache_dalloc_small_tracked;
+#endif
+
 /******************************************************************************/
 /* Data. */
 
@@ -320,6 +334,11 @@ tcache_bin_flush_impl(tsd_t *tsd, tcache_t *tcache, cache_bin_t *cache_bin,
 	} else {
 		assert(binind < nhbins);
 	}
+#ifdef ENABLE_DRAINPROF
+	if (small) {
+		atomic_fetch_add_zu(&g_tcache_flush_calls, 1, ATOMIC_RELAXED);
+	}
+#endif
 	arena_t *tcache_arena = tcache_slow->arena;
 	assert(tcache_arena != NULL);
 
@@ -445,13 +464,28 @@ tcache_bin_flush_impl(tsd_t *tsd, tcache_t *tcache, cache_bin_t *cache_bin,
 				continue;
 			}
 			if (small) {
+#ifdef ENABLE_DRAINPROF
+				/* DISABLED: Old tcache flush instrumentation - we now track at free_fastpath layer
+				atomic_fetch_add_zu(&g_tcache_flush_small_count, 1, ATOMIC_RELAXED);
+				if (g_drainprof == NULL) {
+					atomic_fetch_add_zu(&g_tcache_flush_drainprof_null, 1, ATOMIC_RELAXED);
+				} else if (!edata_slab_get(edata)) {
+					atomic_fetch_add_zu(&g_tcache_flush_not_slab, 1, ATOMIC_RELAXED);
+				} else {
+					uint64_t granule_id = (uint64_t)edata;
+					uint64_t alloc_id = (uint64_t)ptr;
+					drainprof_alloc_deregister(g_drainprof, granule_id, alloc_id);
+					atomic_fetch_add_zu(&g_tcache_flush_tracked, 1, ATOMIC_RELAXED);
+				}
+				*/
+#endif
 				if (arena_dalloc_bin_locked_step(tsdn,
 				    cur_arena, cur_bin, &dalloc_bin_info,
 				    binind, edata, ptr)) {
 					dalloc_slabs[dalloc_count] = edata;
 					dalloc_count++;
 				}
-			} else {
+			} else{
 				if (large_dalloc_safety_checks(edata, ptr,
 				    binind)) {
 					/* See the comment in isfree. */
@@ -1099,3 +1133,20 @@ tcache_postfork_child(tsdn_t *tsdn) {
 void tcache_assert_initialized(tcache_t *tcache) {
 	assert(!cache_bin_still_zero_initialized(&tcache->bins[0]));
 }
+
+#ifdef ENABLE_DRAINPROF
+void
+jemalloc_get_drainprof_flush_stats(uint64_t *flush_calls, uint64_t *small_count, uint64_t *drainprof_null, uint64_t *not_slab, uint64_t *tracked) {
+	*flush_calls = atomic_load_zu(&g_tcache_flush_calls, ATOMIC_RELAXED);
+	*small_count = atomic_load_zu(&g_tcache_flush_small_count, ATOMIC_RELAXED);
+	*drainprof_null = atomic_load_zu(&g_tcache_flush_drainprof_null, ATOMIC_RELAXED);
+	*not_slab = atomic_load_zu(&g_tcache_flush_not_slab, ATOMIC_RELAXED);
+	*tracked = atomic_load_zu(&g_tcache_flush_tracked, ATOMIC_RELAXED);
+}
+
+void
+jemalloc_get_drainprof_dalloc_stats(uint64_t *dalloc_calls, uint64_t *dalloc_tracked) {
+	*dalloc_calls = atomic_load_zu(&g_tcache_dalloc_small_calls, ATOMIC_RELAXED);
+	*dalloc_tracked = atomic_load_zu(&g_tcache_dalloc_small_tracked, ATOMIC_RELAXED);
+}
+#endif
