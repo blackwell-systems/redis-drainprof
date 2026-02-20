@@ -1,3 +1,7 @@
+**Part of the [Drainability Project](https://github.com/blackwell-systems/drainability)** – Redis 7.2 instrumented with jemalloc fastpath hooks for drainability validation
+
+---
+
 This README is just a fast *quick start* document. You can find more detailed documentation at [redis.io](https://redis.io).
 
 What is Redis?
